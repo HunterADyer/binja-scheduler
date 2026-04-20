@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import lzma
 import shutil
+import stat
 import struct
 import tarfile
 import tempfile
@@ -82,9 +83,12 @@ def _scan_archive(
         result.errors.append(f"Max unpack depth exceeded: {archive_logical}")
         return
 
-    tmp = _unpack_archive(archive_path)
+    tmp, unpack_errors = _unpack_archive(archive_path)
+    for error in unpack_errors:
+        result.errors.append(f"{archive_logical}: {error}")
     if tmp is None:
-        result.errors.append(f"Failed to unpack archive: {archive_logical}")
+        if not unpack_errors:
+            result.errors.append(f"Failed to unpack archive: {archive_logical}")
         return
 
     result._temp_dirs.append(tmp)
@@ -213,46 +217,110 @@ def _is_archive(path: Path) -> bool:
     return magic[:4] == b"PK\x03\x04" or magic[:2] == b"\x1f\x8b"
 
 
-def _unpack_archive(path: Path):
+def _archive_member_path(tmp_root: Path, member_name: str) -> Path | None:
+    normalized = member_name.replace("\\", "/").strip()
+    if not normalized:
+        return None
+
+    pure = PurePosixPath(normalized)
+    if pure.is_absolute():
+        return None
+    if any(part == ".." for part in pure.parts):
+        return None
+
+    return tmp_root.joinpath(*pure.parts)
+
+
+def _zip_info_is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0o170000
+    return mode == stat.S_IFLNK
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, tmp_root: Path) -> list[str]:
+    errors: list[str] = []
+    for info in zf.infolist():
+        destination = _archive_member_path(tmp_root, info.filename)
+        if destination is None:
+            errors.append(f"Skipped unsafe zip entry: {info.filename}")
+            continue
+        if info.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        if _zip_info_is_symlink(info):
+            errors.append(f"Skipped symlink zip entry: {info.filename}")
+            continue
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info, "r") as fin, open(destination, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+    return errors
+
+
+def _safe_extract_tar(tf: tarfile.TarFile, tmp_root: Path) -> list[str]:
+    errors: list[str] = []
+    for member in tf.getmembers():
+        destination = _archive_member_path(tmp_root, member.name)
+        if destination is None:
+            errors.append(f"Skipped unsafe tar entry: {member.name}")
+            continue
+        if member.isdir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        if member.issym() or member.islnk():
+            errors.append(f"Skipped symlink tar entry: {member.name}")
+            continue
+        if not member.isfile():
+            errors.append(f"Skipped unsupported tar entry: {member.name}")
+            continue
+
+        extracted = tf.extractfile(member)
+        if extracted is None:
+            errors.append(f"Failed to read tar entry: {member.name}")
+            continue
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with extracted, open(destination, "wb") as fout:
+            shutil.copyfileobj(extracted, fout)
+    return errors
+
+
+def _unpack_archive(path: Path) -> tuple[tempfile.TemporaryDirectory[str] | None, list[str]]:
     tmp = tempfile.TemporaryDirectory(prefix="binja_scheduler_")
     tmp_root = Path(tmp.name)
     name = path.name.lower()
+    errors: list[str] = []
 
     try:
         if zipfile.is_zipfile(str(path)):
             with zipfile.ZipFile(path, "r") as zf:
-                for info in zf.infolist():
-                    normalized = info.filename.replace("\\", "/")
-                    if normalized != info.filename:
-                        info.filename = normalized
-                    zf.extract(info, tmp_root)
-            return tmp
+                errors.extend(_safe_extract_zip(zf, tmp_root))
+            return tmp, errors
 
         if tarfile.is_tarfile(str(path)):
             with tarfile.open(path, "r:*") as tf:
-                tf.extractall(tmp_root, filter="data")
-            return tmp
+                errors.extend(_safe_extract_tar(tf, tmp_root))
+            return tmp, errors
 
         if name.endswith(".gz") and not name.endswith(".tar.gz"):
             out = tmp_root / path.stem
             with gzip.open(path, "rb") as fin, open(out, "wb") as fout:
                 shutil.copyfileobj(fin, fout)
-            return tmp
+            return tmp, errors
 
         if name.endswith(".bz2") and not name.endswith(".tar.bz2"):
             out = tmp_root / path.stem
             with bz2.open(path, "rb") as fin, open(out, "wb") as fout:
                 shutil.copyfileobj(fin, fout)
-            return tmp
+            return tmp, errors
 
         if name.endswith(".xz") and not name.endswith(".tar.xz"):
             out = tmp_root / path.stem
             with lzma.open(path, "rb") as fin, open(out, "wb") as fout:
                 shutil.copyfileobj(fin, fout)
-            return tmp
+            return tmp, errors
     except Exception:
         tmp.cleanup()
-        return None
+        return None, errors
 
     tmp.cleanup()
-    return None
+    return None, errors

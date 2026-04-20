@@ -42,6 +42,8 @@ Useful options:
 run
 start
 status
+stop
+logs
 --metadata ./bndbs/metadata.json
 --initial-timeout-seconds 120
 --retry-threads 4,8
@@ -66,6 +68,18 @@ Status check:
 
 ```bash
 python -m binja_scheduler status --output-dir ./bndbs
+```
+
+Stop a detached run:
+
+```bash
+python -m binja_scheduler stop --output-dir ./bndbs
+```
+
+Tail the scheduler log:
+
+```bash
+python -m binja_scheduler logs --output-dir ./bndbs --lines 80
 ```
 
 ## Output
@@ -95,6 +109,10 @@ successfully.
 `scheduler.log`, so the supervisor and all Binary Ninja worker subprocesses are
 not tied to the terminal that started them.
 
+`stop` terminates the detached scheduler process group and marks the runtime as
+stopped. `logs` prints the tail of `scheduler.log` so you can inspect progress
+without opening files manually.
+
 ## Resume Model
 
 `metadata.json` is the durable job journal.
@@ -120,8 +138,10 @@ The second `start` is safe after a crash, disconnect, or reboot.
 The test suite covers:
 
 - archive discovery across nested zip, tar, and gzip inputs
+- path traversal and symlink rejection during archive extraction
 - timeout-to-retry promotion
 - detached launch bookkeeping
+- detached stop/log inspection
 - interrupted detached run followed by resume
 - reuse of existing successful BNDBs
 

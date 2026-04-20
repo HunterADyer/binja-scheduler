@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gzip
+import io
+import stat
 import tarfile
 import zipfile
 from pathlib import Path
@@ -96,5 +98,54 @@ def test_discover_binaries_finds_binaries_inside_tar(tmp_path: Path) -> None:
         assert len(scan.binaries) == 1
         assert scan.binaries[0].logical_path == f"{tar_path}!payload.bin"
         assert scan.binaries[0].format == "elf"
+    finally:
+        scan.cleanup()
+
+
+def test_discover_binaries_skips_unsafe_zip_entries(tmp_path: Path) -> None:
+    safe_bin = tmp_path / "safe.bin"
+    _write_elf(safe_bin)
+
+    zip_path = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.write(safe_bin, arcname="safe.bin")
+        zf.writestr("../escape.bin", b"\x7fELF" + b"\x00" * 4096)
+
+        link_info = zipfile.ZipInfo("link.bin")
+        link_info.create_system = 3
+        link_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        zf.writestr(link_info, "safe.bin")
+
+    scan = discover_binaries(zip_path, min_size=64)
+    try:
+        assert [binary.logical_path for binary in scan.binaries] == [f"{zip_path}!safe.bin"]
+        assert any("Skipped unsafe zip entry" in error for error in scan.errors)
+        assert any("Skipped symlink zip entry" in error for error in scan.errors)
+    finally:
+        scan.cleanup()
+
+
+def test_discover_binaries_skips_unsafe_tar_entries(tmp_path: Path) -> None:
+    tar_path = tmp_path / "unsafe.tar"
+    payload = b"\x7fELF" + b"\x00" * 4096
+    with tarfile.open(tar_path, "w") as tf:
+        safe_info = tarfile.TarInfo("safe.bin")
+        safe_info.size = len(payload)
+        tf.addfile(safe_info, io.BytesIO(payload))
+
+        escape_info = tarfile.TarInfo("../escape.bin")
+        escape_info.size = len(payload)
+        tf.addfile(escape_info, io.BytesIO(payload))
+
+        link_info = tarfile.TarInfo("link.bin")
+        link_info.type = tarfile.SYMTYPE
+        link_info.linkname = "safe.bin"
+        tf.addfile(link_info)
+
+    scan = discover_binaries(tar_path, min_size=64)
+    try:
+        assert [binary.logical_path for binary in scan.binaries] == [f"{tar_path}!safe.bin"]
+        assert any("Skipped unsafe tar entry" in error for error in scan.errors)
+        assert any("Skipped symlink tar entry" in error for error in scan.errors)
     finally:
         scan.cleanup()

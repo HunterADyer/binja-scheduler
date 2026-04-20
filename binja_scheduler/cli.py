@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +20,7 @@ from binja_scheduler.scheduler import run_scheduler
 RUNTIME_SCHEMA_VERSION = 1
 DEFAULT_RUNTIME_NAME = "runtime.json"
 DEFAULT_LOG_NAME = "scheduler.log"
-_KNOWN_COMMANDS = {"run", "start", "status"}
+_KNOWN_COMMANDS = {"run", "start", "status", "stop", "logs"}
 
 
 def _parse_retry_threads(value: str) -> tuple[int, ...]:
@@ -69,6 +72,15 @@ def _pid_is_running(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _wait_for_process_exit(pid: int, *, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_is_running(pid)
 
 
 def _resolve_output_paths(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -154,6 +166,13 @@ def _build_child_command(args: argparse.Namespace) -> list[str]:
     if args.force:
         cmd.append("--force")
     return cmd
+
+
+def _read_log_tail(path: Path, *, lines: int) -> str:
+    if not path.exists():
+        return ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return "".join(deque(f, maxlen=max(1, lines)))
 
 
 def _read_runtime_status(output_dir: Path, metadata_path: Path) -> dict[str, Any]:
@@ -313,6 +332,113 @@ def _handle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_stop(args: argparse.Namespace) -> int:
+    output_dir, metadata_path = _resolve_output_paths(args)
+    runtime_path = _runtime_path(output_dir)
+    runtime = _load_json(runtime_path)
+    current = _read_runtime_status(output_dir, metadata_path)
+    pid = current["pid"]
+
+    if not current["process_running"]:
+        status = "already_stopped"
+        if current["runtime_status"] in {"running", "starting", "stale"}:
+            _write_json(
+                runtime_path,
+                _runtime_record(
+                    pid=None,
+                    status="stopped",
+                    launch_mode=str(runtime.get("launch_mode", "")),
+                    output_dir=output_dir,
+                    metadata_path=metadata_path,
+                    log_path=Path(str(runtime.get("log_path", _log_path(output_dir)))),
+                    command=list(runtime.get("command", [])),
+                    last_exit_code=runtime.get("last_exit_code"),
+                    error="No running process remained at stop time",
+                ),
+            )
+            status = "stopped_stale_runtime"
+
+        print(json.dumps({
+            "status": status,
+            "runtime_path": str(runtime_path),
+            "pid": pid,
+        }, indent=2))
+        return 0
+
+    stop_signal = signal.SIGKILL if args.force else signal.SIGTERM
+    try:
+        os.killpg(pid, stop_signal)
+    except ProcessLookupError:
+        _write_json(
+            runtime_path,
+            _runtime_record(
+                pid=None,
+                status="stopped",
+                launch_mode=str(runtime.get("launch_mode", "")),
+                output_dir=output_dir,
+                metadata_path=metadata_path,
+                log_path=Path(str(runtime.get("log_path", _log_path(output_dir)))),
+                command=list(runtime.get("command", [])),
+                last_exit_code=runtime.get("last_exit_code"),
+                error="Process exited before stop signal was delivered",
+            ),
+        )
+        print(json.dumps({
+            "status": "stopped_race",
+            "pid": pid,
+            "runtime_path": str(runtime_path),
+        }, indent=2))
+        return 0
+
+    forced_kill = False
+    if not args.force and not _wait_for_process_exit(pid, timeout_seconds=args.grace_seconds):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        forced_kill = True
+        if not _wait_for_process_exit(pid, timeout_seconds=max(1.0, args.grace_seconds)):
+            print(json.dumps({
+                "status": "stop_failed",
+                "pid": pid,
+                "runtime_path": str(runtime_path),
+            }, indent=2))
+            return 1
+
+    _write_json(
+        runtime_path,
+        _runtime_record(
+            pid=None,
+            status="stopped",
+            launch_mode=str(runtime.get("launch_mode", "")),
+            output_dir=output_dir,
+            metadata_path=metadata_path,
+            log_path=Path(str(runtime.get("log_path", _log_path(output_dir)))),
+            command=list(runtime.get("command", [])),
+            last_exit_code=-int(signal.SIGKILL if forced_kill or args.force else signal.SIGTERM),
+            error="Stopped by user request",
+        ),
+    )
+    print(json.dumps({
+        "status": "stopped",
+        "pid": pid,
+        "forced_kill": forced_kill or args.force,
+        "runtime_path": str(runtime_path),
+    }, indent=2))
+    return 0
+
+
+def _handle_logs(args: argparse.Namespace) -> int:
+    output_dir = args.output_dir.expanduser().resolve()
+    log_path = _log_path(output_dir)
+    tail = _read_log_tail(log_path, lines=args.lines)
+    if not tail:
+        print(f"No log output available at {log_path}")
+        return 0
+    print(tail, end="" if tail.endswith("\n") else "\n")
+    return 0
+
+
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", type=Path, required=True, help="Directory or archive to scan")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for flattened hash-named BNDBs")
@@ -347,6 +473,18 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--output-dir", type=Path, required=True, help="Scheduler output directory")
     status_parser.add_argument("--metadata", type=Path, default=None, help="Metadata JSON path (default: <output-dir>/metadata.json)")
     status_parser.set_defaults(handler=_handle_status)
+
+    stop_parser = subparsers.add_parser("stop", help="Stop a detached scheduler run")
+    stop_parser.add_argument("--output-dir", type=Path, required=True, help="Scheduler output directory")
+    stop_parser.add_argument("--metadata", type=Path, default=None, help="Metadata JSON path (default: <output-dir>/metadata.json)")
+    stop_parser.add_argument("--grace-seconds", type=float, default=5.0, help="Wait this long after SIGTERM before escalating to SIGKILL")
+    stop_parser.add_argument("--force", action="store_true", help="Send SIGKILL immediately instead of SIGTERM")
+    stop_parser.set_defaults(handler=_handle_stop)
+
+    logs_parser = subparsers.add_parser("logs", help="Print the tail of scheduler.log")
+    logs_parser.add_argument("--output-dir", type=Path, required=True, help="Scheduler output directory")
+    logs_parser.add_argument("--lines", type=int, default=40, help="Number of lines to print from the end of the log")
+    logs_parser.set_defaults(handler=_handle_logs)
 
     return parser
 
