@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binja-scheduler"
+version = "0.1.0"
+description = "Two-pass Binary Ninja headless scheduler for archive-backed corpora"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+binja-scheduler = "binja_scheduler.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["binja_scheduler*"]
